@@ -1,122 +1,84 @@
-#!/bin/bash
-# OCI Region-Aware Ubuntu Mirror Selector with Reachability Check
-# Works on Ubuntu 22.04 and 24.04 across all OCI regions globally
-
+#!/usr/bin/env bash
 set -euo pipefail
+IFS=$'\n\t'
 
-log() { echo "[$(date -u +'%a %b %d %H:%M:%S UTC %Y')] $*"; }
+echo "[$(date)] Starting OCI region-aware mirror selection"
 
 TMPDIR=$(mktemp -d /tmp/oci-mirror-XXXX)
-RESULTS_FILE="$TMPDIR/mirror_results.tsv"
-INFO_FILE="/etc/cloud/mirror-info.txt"
-MAX_TESTS=12
-MAX_PARALLEL=6
-CURL_OPTS="-L --silent --show-error --max-time 3 --connect-timeout 2"
+RESULTS="$TMPDIR/mirror_results.tsv"
 
-log "Starting OCI region-aware mirror selection"
+# Optionally allow custom mirrors
+CUSTOM_MIRRORS_FILE=${CUSTOM_MIRRORS_FILE:-""}
 
-# Detect OCI region from metadata
-OCI_REGION=$(curl -s http://169.254.169.254/opc/v1/instance/ | grep -o '"region":"[^"]*' | cut -d'"' -f4 || echo "unknown")
-log "OCI region detected: $OCI_REGION"
+# OCI region detection (best-effort)
+OCI_REGION=$(curl -fsSL -m 2 http://169.254.169.254/opc/v1/instance/region || echo "unknown")
+echo "[$(date)] OCI region detected: $OCI_REGION"
 
-# Set region keywords to prioritize likely mirrors
-case "$OCI_REGION" in
-  *tokyo*|*osaka*|*seoul*|*singapore*|*mumbai*|*sydney*)
-    PRIORITY_KEYWORDS="jp kr sg in au asia ap archive.ubuntu.com"
-    ;;
-  *frankfurt*|*zurich*|*stockholm*|*paris*|*amsterdam*|*london*)
-    PRIORITY_KEYWORDS="de fr se nl uk eu archive.ubuntu.com"
-    ;;
-  *ashburn*|*phoenix*|*chicago*|*montreal*|*toronto*)
-    PRIORITY_KEYWORDS="us ca na archive.ubuntu.com"
-    ;;
-  *saopaulo*|*mexico*|*santiago*)
-    PRIORITY_KEYWORDS="br mx cl sa la archive.ubuntu.com"
-    ;;
-  *)
-    PRIORITY_KEYWORDS="archive.ubuntu.com"
-    ;;
-esac
-log "Priority keywords: $PRIORITY_KEYWORDS"
+# Gather mirrors from Launchpad
+echo "[$(date)] Gathering mirror candidates from Launchpad..."
+LAUNCHPAD_MIRRORS=($(curl -fsSL https://launchpad.net/ubuntu/+archivemirrors | \
+                     grep -oP 'http[s]?://[^\s"]+/ubuntu' | sort -u))
 
-# --- Gather mirrors from Launchpad and mirrors.ubuntu.com ---
-log "Gathering mirror candidates..."
-{
-  curl -fsSL https://launchpad.net/ubuntu/+archivemirrors || true
-  curl -fsSL https://mirrors.ubuntu.com/mirrors.txt || true
-} > "$TMPDIR/all_mirrors_raw.txt"
+# Include archive.ubuntu.com fallback
+ARCHIVE_MIRRORS=(
+    http://archive.ubuntu.com/ubuntu/
+)
 
-# Extract and sanitize URLs
-grep -Eo '(http|https)://[^"'"'"'<> ]+' "$TMPDIR/all_mirrors_raw.txt" \
-  | grep ubuntu \
-  | grep -vE 'launchpad.net|askubuntu.com|ppa.launchpad.net' \
-  | sed 's|/$||' \
-  | sort -u > "$TMPDIR/all_mirrors.txt"
-
-TOTAL=$(wc -l < "$TMPDIR/all_mirrors.txt")
-log "Collected $TOTAL unique mirrors"
-
-# --- Prioritize by region keywords ---
-grep -iE "$(echo $PRIORITY_KEYWORDS | sed 's/ /|/g')" "$TMPDIR/all_mirrors.txt" > "$TMPDIR/prioritized.txt" || true
-cat "$TMPDIR/all_mirrors.txt" >> "$TMPDIR/prioritized.txt"
-sort -u "$TMPDIR/prioritized.txt" | head -n 100 > "$TMPDIR/mirrors_top.txt"
-
-log "Prioritized mirrors written. Testing reachability..."
-
-# --- Reachability check ---
-REACHABLE_FILE="$TMPDIR/reachable.txt"
-touch "$REACHABLE_FILE"
-
-xargs -I{} -P "$MAX_PARALLEL" bash -c '
-  url="{}"
-  if curl --head --silent --max-time 3 --connect-timeout 2 "$url/dists/stable/Release" >/dev/null 2>&1 ||
-     curl --head --silent --max-time 3 --connect-timeout 2 "$url/dists/noble/Release" >/dev/null 2>&1; then
-    echo "$url" >> "'"$REACHABLE_FILE"'"
-  fi
-' < "$TMPDIR/mirrors_top.txt"
-
-REACHABLE_COUNT=$(wc -l < "$REACHABLE_FILE")
-log "Reachable mirrors: $REACHABLE_COUNT"
-
-if [[ $REACHABLE_COUNT -lt 2 ]]; then
-  log "Too few reachable mirrors. Falling back to archive.ubuntu.com"
-  echo "http://archive.ubuntu.com/ubuntu" > "$REACHABLE_FILE"
+# Include custom mirrors if provided
+CUSTOM_MIRRORS=()
+if [[ -f "$CUSTOM_MIRRORS_FILE" ]]; then
+    CUSTOM_MIRRORS=($(grep -v '^#' "$CUSTOM_MIRRORS_FILE" | grep -v '^$'))
 fi
 
-# --- Throughput tests ---
-TEST_MIRRORS=$(head -n "$MAX_TESTS" "$REACHABLE_FILE")
-log "Testing up to $MAX_TESTS mirrors for bandwidth..."
+# Combine all mirrors
+CANDIDATES=( "${CUSTOM_MIRRORS[@]}" "${LAUNCHPAD_MIRRORS[@]}" "${ARCHIVE_MIRRORS[@]}" )
 
-echo "$TEST_MIRRORS" | xargs -I{} -P "$MAX_PARALLEL" bash -c '
-  url="{}"
-  start=$(date +%s.%N)
-  bytes=$(curl -w "%{size_download}" -o /dev/null '"$CURL_OPTS"' "$url/dists/stable/Release" 2>/dev/null || echo 0)
-  end=$(date +%s.%N)
-  elapsed=$(echo "$end - $start" | bc)
-  echo -e "${bytes}\t${elapsed}\t${url}"
-' | sort -nr -k1 > "$RESULTS_FILE"
+# Filter reachable mirrors
+echo "[$(date)] Checking mirror reachability..."
+REACHABLE=()
+for mirror in "${CANDIDATES[@]}"; do
+    if curl --head --max-time 5 -fsSL "$mirror" &>/dev/null; then
+        REACHABLE+=("$mirror")
+    fi
+done
+echo "[$(date)] ${#REACHABLE[@]} reachable mirrors found."
 
-BEST_MIRROR=$(head -n1 "$RESULTS_FILE" | awk '{print $3}')
-BEST_SPEED=$(head -n1 "$RESULTS_FILE" | awk '{print $1}')
+# Limit test to top 12 mirrors for speed
+TEST_MIRRORS=("${REACHABLE[@]:0:12}")
 
-log "Best mirror: $BEST_MIRROR (speed_bytes=$BEST_SPEED)"
+# Measure throughput
+echo "[$(date)] Running throughput tests..."
+> "$RESULTS"
+for mirror in "${TEST_MIRRORS[@]}"; do
+    {
+        SPEED=$(curl -s -w '%{speed_download} %{time_total}\n' -o /dev/null "$mirror/README")
+        echo -e "$SPEED\t$mirror" >> "$RESULTS"
+    } &
+done
+wait
 
-# --- Update APT sources ---
-if [[ -n "$BEST_MIRROR" ]]; then
-  sudo sed -i "s|URIs:.*|URIs: $BEST_MIRROR|" /etc/apt/sources.list.d/ubuntu.sources || true
-  log "Updated /etc/apt/sources.list.d/ubuntu.sources"
-fi
+# Select best mirror
+BEST_MIRROR=$(sort -nrk1 "$RESULTS" | head -n1 | awk '{print $3}')
+BEST_SPEED=$(sort -nrk1 "$RESULTS" | head -n1 | awk '{print $1}')
+echo "[$(date)] Best mirror: $BEST_MIRROR (speed_bytes=$BEST_SPEED)"
 
-# --- Save results ---
-{
-  echo "OCI region: $OCI_REGION"
-  echo "Selected mirror: $BEST_MIRROR"
-  echo "Selected speed_bytes: $BEST_SPEED"
-  echo "Tested candidates:"
-  cat "$RESULTS_FILE"
-} | tee "$INFO_FILE"
+# Update APT sources
+echo "[$(date)] Updating APT sources..."
+cat <<EOF | sudo tee /etc/apt/sources.list.d/ubuntu.sources
+## URIs: A URL to the repository (you may add multiple URLs)
+URIs: $BEST_MIRROR
+URIs: $BEST_MIRROR
+EOF
 
-log "Mirror selection complete. Best mirror: $BEST_MIRROR"
-log "Results file: $RESULTS_FILE"
-log "Cleaning up temp directory $TMPDIR"
+echo "[$(date)] Mirror selection complete. Results stored in $RESULTS"
+echo "OCI region: $OCI_REGION" | sudo tee /etc/cloud/mirror-info.txt
+echo "Selected mirror: $BEST_MIRROR" | sudo tee -a /etc/cloud/mirror-info.txt
+echo "Selected speed_bytes: $BEST_SPEED" | sudo tee -a /etc/cloud/mirror-info.txt
+echo "Tested candidates:" | sudo tee -a /etc/cloud/mirror-info.txt
+sort -nrk1 "$RESULTS" | sudo tee -a /etc/cloud/mirror-info.txt
+
+# Optional: run apt-get update
+sudo apt-get update -y || true
+
+# Cleanup
 rm -rf "$TMPDIR"
