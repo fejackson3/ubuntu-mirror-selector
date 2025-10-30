@@ -1,5 +1,7 @@
 #!/bin/bash
 # OCI-ready Ubuntu 22.04+ mirror selector
+# Fully fixed: sed replacement now escapes slashes and special characters
+
 set -e
 
 LOGFILE="/var/log/mirror-selector.log"
@@ -33,18 +35,13 @@ if ! curl -fsSL "$MIRROR_LIST_URL" -o mirrors.txt; then
     }
 fi
 
-# Default fallback mirror if none reachable
 FALLBACK_MIRROR="http://archive.ubuntu.com/ubuntu/"
-
 BEST_MIRROR=""
 BEST_SPEED=0
 TEST_PATH="dists/$RELEASE/Release"
 
-# Only proceed if mirrors.txt is non-empty
 if [ -s mirrors.txt ]; then
-    # Read a random subset into an array to avoid subshell issues
     mapfile -t TEST_MIRRORS < <(shuf mirrors.txt | head -n 8)
-
     for M in "${TEST_MIRRORS[@]}"; do
         MS="${M%/}/"  # ensure trailing slash
         URL="${MS}${TEST_PATH}"
@@ -59,7 +56,6 @@ if [ -s mirrors.txt ]; then
     done
 fi
 
-# Fallback if no mirror succeeded
 if [ -z "$BEST_MIRROR" ]; then
     BEST_MIRROR="$FALLBACK_MIRROR"
     echo "[$(date)] Using fallback mirror: $BEST_MIRROR" >> "$LOGFILE"
@@ -72,16 +68,16 @@ echo "Mirror selected: $BEST_MIRROR" > "$INFOFILE"
 chmod 644 "$INFOFILE"
 echo "[$(date)] Wrote mirror info to $INFOFILE" >> "$LOGFILE"
 
-# Update .sources files for Ubuntu 22.04+
+# Update .sources files safely
 for f in /etc/apt/sources.list.d/*.sources; do
     if grep -Eq '^URIs:\s*(http|https)://.*(ubuntu\.com|archive\.ubuntu\.com|security\.ubuntu\.com)' "$f"; then
-        sed -i -E "s|^(URIs:\s*)(http|https)://[^ ]*|\\1${BEST_MIRROR}|" "$f"
+        ESCAPED_MIRROR=$(printf '%s\n' "$BEST_MIRROR" | sed 's/[&/\]/\\&/g')
+        sed -i -E "s|^(URIs:\s*)(http|https)://[^ ]*|\1${ESCAPED_MIRROR}|" "$f"
         echo "[$(date)] Updated $f → ${BEST_MIRROR}" >> "$LOGFILE"
     else
         echo "[$(date)] Skipping $f (no ubuntu.com/ubuntu, archive, or security entries)" >> "$LOGFILE"
     fi
 done
 
-# Update apt cache
 apt-get update -y >> "$LOGFILE"
 echo "[$(date)] Mirror configuration complete." >> "$LOGFILE"
