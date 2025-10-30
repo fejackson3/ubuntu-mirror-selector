@@ -1,5 +1,5 @@
 #!/bin/bash
-# Mirror selector for Ubuntu 22.04+
+# Mirror selector for Ubuntu 22.04+ (OCI-ready)
 set -e
 
 LOGFILE="/var/log/mirror-selector.log"
@@ -36,8 +36,10 @@ BEST_MIRROR=""
 BEST_SPEED=0
 TEST_PATH="dists/$RELEASE/Release"
 
-# Test up to 8 random mirrors
-shuf mirrors.txt | head -n 8 | while read -r M; do
+# Avoid subshell: map mirrors into array
+mapfile -t TEST_MIRRORS < <(shuf mirrors.txt | head -n 8)
+
+for M in "${TEST_MIRRORS[@]}"; do
     MS="${M%/}/"
     URL="${MS}${TEST_PATH}"
     echo "[$(date)] Testing mirror: $MS" >> "$LOGFILE"
@@ -63,13 +65,13 @@ echo "Mirror selected: $BEST_MIRROR" > "$INFOFILE"
 chmod 644 "$INFOFILE"
 echo "[$(date)] Wrote mirror info to $INFOFILE" >> "$LOGFILE"
 
-# Update .sources files if they have ubuntu.com entries
+# Update .sources files: match ubuntu.com, archive.ubuntu.com, security.ubuntu.com
 for f in /etc/apt/sources.list.d/*.sources; do
-    if grep -Eq '^URIs:\s*(http|https)://[^ ]*ubuntu\.com/ubuntu/' "$f"; then
-        sed -i -E "s|^(URIs:\s*)(http|https)://[^ ]*ubuntu\.com/ubuntu/|\1${BEST_MIRROR}|" "$f"
+    if grep -Eq '^URIs:\s*(http|https)://.*(ubuntu\.com|archive\.ubuntu\.com|security\.ubuntu\.com)' "$f"; then
+        sed -i -E "s|^(URIs:\s*)(http|https)://[^ ]*|\\1${BEST_MIRROR}|" "$f"
         echo "[$(date)] Updated $f → ${BEST_MIRROR}" >> "$LOGFILE"
     else
-        echo "[$(date)] Skipping $f (no ubuntu.com/ubuntu entry)" >> "$LOGFILE"
+        echo "[$(date)] Skipping $f (no ubuntu.com/ubuntu or archive/security entries)" >> "$LOGFILE"
     fi
 done
 
