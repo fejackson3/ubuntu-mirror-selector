@@ -1,102 +1,92 @@
 #!/bin/bash
-# Ubuntu Mirror Optimizer for OCI
-# Author: ChatGPT (optimized for Frank Jackson)
-# Version: 2.0
-# Tested on Ubuntu 22.04 / 24.04
+# mirror-selector.sh
+# OCI / Ubuntu 22.04+ mirror selector
+# Fully robust: works with cloud-init, manual runs, and structured .sources files
 
 set -euo pipefail
 
-LOG_FILE="/var/log/mirror-optimizer.log"
-INFO_FILE="/etc/cloud/mirror-info.txt"
-TEMP_DIR="/tmp/mirror-optimizer"
-mkdir -p "$TEMP_DIR"
+LOGFILE="/var/log/mirror-selector.log"
+INFOFILE="/etc/cloud/mirror-info.txt"
 
-echo "[INFO] Starting mirror optimization..." | tee "$LOG_FILE"
+mkdir -p /etc/cloud
+echo "[$(date)] Starting mirror selection…" >> "$LOGFILE"
 
-########################################
-# 1. Collect candidate mirrors
-########################################
-echo "[INFO] Fetching mirror lists..." | tee -a "$LOG_FILE"
+# ---- 1. Check dependencies ----
+REQUIRED_CMDS=(curl jq shuf lsb_release awk)
+for cmd in "${REQUIRED_CMDS[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "[$(date)] ERROR: required command '$cmd' not found" >> "$LOGFILE"
+        exit 1
+    fi
+done
 
-# Canonical curated list
-curl -fsSL "http://mirrors.ubuntu.com/mirrors.txt" -o "$TEMP_DIR/mirrors.txt" || true
+# ---- 2. Determine Ubuntu codename ----
+RELEASE=$(lsb_release -cs)
+echo "[$(date)] Ubuntu codename: $RELEASE" >> "$LOGFILE"
 
-# Launchpad HTML mirror registry
-curl -fsSL "https://launchpad.net/ubuntu/+archivemirrors" -o "$TEMP_DIR/launchpad.html" || true
+# ---- 3. Fetch mirrors ----
+TMPDIR=$(mktemp -d)
+cd "$TMPDIR"
 
-# Extract URLs from Launchpad page (regex for http(s):// + ubuntu/)
-grep -Eo 'https?://[^"]+ubuntu/?' "$TEMP_DIR/launchpad.html" | sort -u > "$TEMP_DIR/launchpad.txt"
+PRIMARY_URL="http://mirrors.ubuntu.com/mirrors.txt"
+FALLBACK_URL="https://mirrors.ubuntu.com/mirrors.txt"
+FALLBACK_MIRROR="http://archive.ubuntu.com/ubuntu/"
 
-# Merge lists
-cat "$TEMP_DIR"/{mirrors.txt,launchpad.txt} 2>/dev/null | grep -E '^https?://' | sort -u > "$TEMP_DIR/all_mirrors.txt"
+if ! curl -fsSL "$PRIMARY_URL" -o mirrors.txt; then
+    echo "[$(date)] WARNING: HTTP fetch failed, trying HTTPS fallback…" >> "$LOGFILE"
+    if ! curl -fsSL "$FALLBACK_URL" -o mirrors.txt; then
+        echo "[$(date)] ERROR: Could not fetch mirror list. Using fallback mirror." >> "$LOGFILE"
+        echo "$FALLBACK_MIRROR" > mirrors.txt
+    fi
+fi
 
-# Always add fallback
-echo "http://archive.ubuntu.com/ubuntu/" >> "$TEMP_DIR/all_mirrors.txt"
-
-TOTAL_MIRRORS=$(wc -l < "$TEMP_DIR/all_mirrors.txt")
-echo "[INFO] Total mirrors found: $TOTAL_MIRRORS" | tee -a "$LOG_FILE"
-
-########################################
-# 2. Test mirrors for latency and speed
-########################################
-TEST_FILE="dists/stable/Release"
+# ---- 4. Test mirrors and pick fastest ----
 BEST_MIRROR=""
-BEST_SCORE=0
+BEST_SPEED=0
+TEST_PATH="dists/$RELEASE/Release"
 
-echo "[INFO] Testing mirrors for latency and throughput..." | tee -a "$LOG_FILE"
-
-while read -r MIRROR; do
-    echo -n "Testing $MIRROR ... " | tee -a "$LOG_FILE"
-
-    # Check reachability
-    if ! curl -fsI --max-time 3 "$MIRROR" >/dev/null 2>&1; then
-        echo "unreachable" | tee -a "$LOG_FILE"
-        continue
+mapfile -t TEST_MIRRORS < <(shuf mirrors.txt | head -n 8)
+for M in "${TEST_MIRRORS[@]}"; do
+    MS="${M%/}/"  # Ensure trailing slash
+    URL="${MS}${TEST_PATH}"
+    echo "[$(date)] Testing mirror: $MS" >> "$LOGFILE"
+    SPEED=$(curl -o /dev/null -s --max-time 5 -w "%{speed_download}" "$URL" || echo 0)
+    SPEED_INT=$(printf "%.0f" "$SPEED")
+    echo "[$(date)] Mirror ${MS} speed: ${SPEED_INT} bytes/sec" >> "$LOGFILE"
+    if (( SPEED_INT > BEST_SPEED )); then
+        BEST_SPEED=$SPEED_INT
+        BEST_MIRROR=$MS
     fi
+done
 
-    # Measure latency (seconds)
-    LATENCY=$(curl -o /dev/null -s -w "%{time_total}" --max-time 5 "$MIRROR$TEST_FILE" || echo 10)
-
-    # Measure throughput (kB/s) using 1MB chunk
-    SPEED=$(curl -o /dev/null -s -w "%{speed_download}" --max-time 5 "$MIRROR$TEST_FILE" || echo 0)
-    SPEED_KB=$(awk "BEGIN {print $SPEED/1024}")
-
-    # Scoring heuristic: higher is better
-    SCORE=$(awk "BEGIN {print ($SPEED_KB / ($LATENCY+0.1))}")
-
-    echo "lat=${LATENCY}s speed=${SPEED_KB}KB/s score=${SCORE}" | tee -a "$LOG_FILE"
-
-    # Track best
-    if (( $(echo "$SCORE > $BEST_SCORE" | bc -l) )); then
-        BEST_SCORE="$SCORE"
-        BEST_MIRROR="$MIRROR"
-    fi
-
-done < "$TEMP_DIR/all_mirrors.txt"
-
-########################################
-# 3. Apply best mirror
-########################################
+# If no mirror succeeded, use fallback
 if [[ -z "$BEST_MIRROR" ]]; then
-    echo "[WARN] No valid mirror found; falling back to archive.ubuntu.com" | tee -a "$LOG_FILE"
-    BEST_MIRROR="http://archive.ubuntu.com/ubuntu/"
-fi
-
-echo "Mirror selected: $BEST_MIRROR" | tee -a "$LOG_FILE"
-echo "Mirror selected: $BEST_MIRROR" | sudo tee "$INFO_FILE"
-
-# Update .sources file (Ubuntu 24.x+)
-if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
-    sudo sed -i -E "s|URIs:.*|URIs: $BEST_MIRROR|" /etc/apt/sources.list.d/ubuntu.sources
+    BEST_MIRROR="$FALLBACK_MIRROR"
+    echo "[$(date)] Using fallback mirror: $BEST_MIRROR" >> "$LOGFILE"
 else
-    sudo bash -c "cat >/etc/apt/sources.list.d/ubuntu.sources" <<EOF
-Types: deb
-URIs: $BEST_MIRROR
-Suites: $(lsb_release -cs) $(lsb_release -cs)-updates $(lsb_release -cs)-backports $(lsb_release -cs)-security
-Components: main universe multiverse restricted
-EOF
+    echo "[$(date)] Selected fastest mirror: $BEST_MIRROR (speed ${BEST_SPEED} bytes/sec)" >> "$LOGFILE"
 fi
 
-sudo apt-get update -y || true
+# ---- 5. Write audit info ----
+echo "Mirror selected: $BEST_MIRROR" > "$INFOFILE"
+chmod 644 "$INFOFILE"
+echo "[$(date)] Wrote mirror info to $INFOFILE" >> "$LOGFILE"
 
-echo "[DONE] Mirror optimization completed successfully." | tee -a "$LOG_FILE"
+# ---- 6. Update .sources files safely (Ubuntu 22.04+) ----
+for f in /etc/apt/sources.list.d/*.sources; do
+    if grep -Eq '^URIs:\s*(http|https)://.*(ubuntu\.com|archive\.ubuntu\.com|security\.ubuntu\.com)' "$f"; then
+        # Use awk to safely replace the URIs line
+        awk -v mirror="$BEST_MIRROR" '
+            /^URIs:/ { print "URIs: " mirror; next }
+            { print }
+        ' "$f" | sudo tee "${f}.tmp" >/dev/null
+        sudo mv "${f}.tmp" "$f"
+        echo "[$(date)] Updated $f → ${BEST_MIRROR}" >> "$LOGFILE"
+    else
+        echo "[$(date)] Skipping $f (no ubuntu.com/ubuntu, archive, or security entries)" >> "$LOGFILE"
+    fi
+done
+
+# ---- 7. Run apt update ----
+sudo apt-get update -y >> "$LOGFILE" 2>&1
+echo "[$(date)] Mirror configuration complete." >> "$LOGFILE"
